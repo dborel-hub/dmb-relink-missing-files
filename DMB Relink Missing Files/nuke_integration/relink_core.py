@@ -49,58 +49,93 @@ def _q(value):
     return '"%s"' % s
 
 
-def iter_selected_node_names(max_nodes=500):
+def _enumerate_selected(max_nodes=5000):
     """
-    Yield the name of every currently selected node.
+    Return [(handle, real_name), ...] for every selected node. TCL only.
 
-    IMPORTANT: this must NOT call nuke.tcl('selected_node %d' % i) once per
-    index from Python. In real Nuke (confirmed by testing), once the index
-    goes out of range, 'selected_node <i>' errors INSIDE the TCL
-    interpreter, but nuke.tcl() does not raise a Python exception for it -
-    it silently returns the last successful result again. Looping that from
-    Python therefore never stops: it just repeats the last real node name
-    until max_nodes is hit (this previously showed, e.g., one selected node
-    500 times over).
-
-    Instead, do the whole loop inside a single TCL script, using TCL's own
-    'catch' to detect the real out-of-range error and stop there. One
-    nuke.tcl() call, no Python node objects, no per-index ambiguity.
+    In real Nuke, 'selected_node' ignores any index: it returns ONE node
+    (the "current" one) as an internal handle like 'node1fbea980b00', and
+    never the real name ('Read1'). So the whole selection is walked by
+    taking the current node, deselecting it, and asking again until
+    nothing is left; the original selection is restored at the end.
+    'value <handle>.name' gives the real node name.
     """
-    script = (
-        'set _dmb_names {}\n'
-        'for {set _dmb_i 0} {$_dmb_i < %d} {incr _dmb_i} {\n'
-        '    if {[catch {set _dmb_n [selected_node $_dmb_i]}]} { break }\n'
-        '    lappend _dmb_names $_dmb_n\n'
-        '}\n'
-        'join $_dmb_names "\\n"'
-    ) % max_nodes
-
-    try:
-        result = _tcl(script)
-    except Exception:
-        return
-
-    if not result:
-        return
-
+    handles = []
     seen = set()
-    for name in result.split('\n'):
-        name = name.strip()
-        if name and name not in seen:
-            seen.add(name)
-            yield name
+    for _ in range(max_nodes):
+        _prime()
+        try:
+            h = (_tcl('selected_node') or '').strip()
+        except Exception:
+            break
+        if not h or h in seen:
+            break
+        seen.add(h)
+        handles.append(h)
+        try:
+            _tcl('knob %s.selected false' % h)
+        except Exception:
+            break
+
+    result = []
+    for h in handles:
+        name = ''
+        _prime()
+        try:
+            name = (_tcl('value %s.name' % h) or '').strip()
+        except Exception:
+            name = ''
+        result.append((h, name or h))
+        try:
+            _tcl('knob %s.selected true' % h)
+        except Exception:
+            pass
+    return result
 
 
-def read_knob(node_name, knob_name):
+def iter_selected_node_names(max_nodes=5000):
+    """Yield the real name of every currently selected node (TCL only)."""
+    for _h, name in _enumerate_selected(max_nodes):
+        yield name
+
+
+def _prime():
     """
-    Read a knob's raw string value via TCL. Returns None if it fails (the
-    knob doesn't exist on this node, or the node doesn't exist).
+    Reset the TCL interpreter result to "". In real Nuke a failing command
+    can make nuke.tcl() hand back the PREVIOUS command's result instead of
+    raising, which would make one node appear to have another node's path.
     """
     try:
-        value = _tcl('value %s' % _q('%s.%s' % (node_name, knob_name)))
-        return value if value else None
+        _tcl('set _dmb_prime ""')
     except Exception:
-        return None
+        pass
+
+
+def read_knob(node_name, knob_name, debug=None):
+    """
+    Read a knob's string value via TCL. 'knob node.knob' returns the RAW
+    value (keeps %04d / #### tokens); 'value node.knob' returns the value
+    already evaluated for the current frame, which for a missing Read can
+    be a path that exists, so the raw form is tried first. Returns None if
+    the knob is missing/empty. If `debug` (a list) is given, what the
+    first attempts returned is appended to it.
+    """
+    target = '%s.%s' % (node_name, knob_name)
+    cmds = ('knob %s' % _q(target), 'value %s' % _q(target),
+            'knob %s' % target, 'value %s' % target)
+    for n, cmd in enumerate(cmds):
+        _prime()
+        try:
+            value = _tcl(cmd)
+        except Exception as e:
+            if debug is not None and n < 2:
+                debug.append('%s: ERROR %s' % (cmd.split()[0], str(e)[:50]))
+            continue
+        if debug is not None and n < 2:
+            debug.append('%s = %r' % (cmd.split()[0], (value or '')[:80]))
+        if value:
+            return value
+    return None
 
 
 def write_knob(node_name, knob_name, value):
@@ -128,74 +163,142 @@ def _normalize(p):
 # Sequence pattern helpers - pure string/os work, no Nuke calls at all
 # ------------------------------------------------------------------
 
+# Windows file attributes of a cloud placeholder that is not downloaded
+# (Dropbox / OneDrive "online-only"): RECALL_ON_DATA_ACCESS, RECALL_ON_OPEN, OFFLINE.
+_CLOUD_ATTRS = 0x400000 | 0x40000 | 0x1000
+
+
+def _is_cloud_only(st):
+    return bool(getattr(st, 'st_file_attributes', 0) & _CLOUD_ATTRS)
+
+
 def _split_sequence_pattern(path):
     """
-    Split a path's basename into (head, ext, style, padding) describing its
-    frame token, if any. style is 'printf' (%04d), 'hash' (####), 'number'
-    (a bare trailing number - a single specific frame, not a real sequence
-    token), or None for a single non-sequence file.
+    Split a path's basename into head / frame token / tail.
+    style: 'printf' (%04d), 'hash' (####) - the token can sit ANYWHERE in the
+    name, e.g. shot.####.cryptomatte.exr -, 'number' (a bare trailing frame
+    number before the extension: a single specific frame), or None (plain file).
+    Returns {'style', 'head', 'tail', 'padding'} (tail includes the extension).
     """
-    path = _normalize(path)
-    base = os.path.basename(path)
-    root, ext = os.path.splitext(base)
+    base = os.path.basename(_normalize(path))
 
-    m = re.search(r'%(0?)(\d+)d', root)
+    m = FRAME_TOKEN_RE.search(base)
     if m:
-        pad = int(m.group(2))
-        head = re.sub(r'%(0?\d+)d', '', root)
-        return {'style': 'printf', 'head': head, 'ext': ext, 'padding': pad}
+        tok = m.group(0)
+        if tok.startswith('#'):
+            style, pad = 'hash', len(tok)
+        else:
+            digits = re.search(r'\d+', tok)
+            style, pad = 'printf', (int(digits.group()) if digits else None)
+        return {'style': style, 'head': base[:m.start()],
+                'tail': base[m.end():], 'padding': pad}
 
-    if '#' in root:
-        pad = root.count('#')
-        head = root.replace('#' * pad, '')
-        return {'style': 'hash', 'head': head, 'ext': ext, 'padding': pad}
-
+    root, ext = os.path.splitext(base)
     m = re.search(r'^(.*?)(\d+)$', root)
     if m:
-        head, frame_str = m.group(1), m.group(2)
-        return {'style': 'number', 'head': head, 'ext': ext,
-                'frame': int(frame_str), 'padding': len(frame_str)}
+        return {'style': 'number', 'head': m.group(1), 'tail': ext,
+                'padding': len(m.group(2))}
 
-    return {'style': None, 'head': root, 'ext': ext, 'padding': None}
+    return {'style': None, 'head': root, 'tail': ext, 'padding': None}
 
 
-def _build_sequence_value(dirpath, head, ext, padding, prefer_style):
+def _build_sequence_value(dirpath, head, tail, padding, prefer_style):
     if prefer_style == 'hash':
-        base = '%s%s%s' % (head, '#' * padding, ext)
+        base = '%s%s%s' % (head, '#' * padding, tail)
     else:
-        base = '%s%%0%dd%s' % (head, padding, ext)
+        base = '%s%%0%dd%s' % (head, padding, tail)
     return _normalize(os.path.join(dirpath, base))
 
 
-def is_missing_path(raw_value):
+def path_state(raw_value):
     """
-    Direct existence check on the raw knob string - no frame substitution
-    needed. For a sequence, the raw value still contains its frame token
-    (e.g. '####' or '%04d'), which never matches a real file on disk, so
-    this naturally flags sequences as needing a check; find_replacement()
-    below does the real frame-aware matching against disk.
+    'ok'      - the file (or, for a %04d/#### path, at least one frame) is on
+                disk and downloaded
+    'cloud'   - it is listed but not downloaded (Dropbox/OneDrive online-only),
+                so Nuke can't read it
+    'missing' - nothing there
     """
     try:
-        return not os.path.exists(_normalize(raw_value))
+        path = _normalize(raw_value)
+        base = os.path.basename(path)
+        if not FRAME_TOKEN_RE.search(base):
+            if not os.path.exists(path):
+                return 'missing'
+            return 'cloud' if _is_cloud_only(os.stat(path)) else 'ok'
+
+        directory = os.path.dirname(path)
+        if not os.path.isdir(directory):
+            return 'missing'
+        parts = FRAME_TOKEN_RE.split(base)
+        rx = re.compile(
+            '^' + ''.join(re.escape(p) if i % 2 == 0 else r'\d+'
+                          for i, p in enumerate(parts)) + '$', re.IGNORECASE)
+        found = False
+        with os.scandir(directory) as it:
+            for entry in it:
+                if rx.match(entry.name):
+                    found = True
+                    if not _is_cloud_only(entry.stat()):
+                        return 'ok'
+        return 'cloud' if found else 'missing'
     except Exception:
-        return True
+        return 'missing'
+
+
+def is_missing_path(raw_value):
+    """True unless path_state() says the file is really there and downloaded."""
+    return path_state(raw_value) != 'ok'
 
 
 # ------------------------------------------------------------------
 # Scanning
 # ------------------------------------------------------------------
 
-def _candidate_knob_for_node(node_name):
+def _candidate_knob_for_node(node_name, debug=None):
     """
     Try each known path knob in turn (via TCL), returning
     (knob_name, raw_value) for the first one that exists and has a
     non-empty value, or (None, None) if this node has none of them.
     """
     for knob_name in KNOBS_TO_TRY:
-        value = read_knob(node_name, knob_name)
+        value = read_knob(node_name, knob_name, debug)
         if value:
             return knob_name, value
     return None, None
+
+
+last_scan_info = {'selected': 0, 'no_path_knob': 0, 'existing': 0, 'details': []}
+
+
+def _scan_names(names):
+    """
+    Check each node NAME for a missing path (TCL only). Nodes without a
+    file path (Grade, Merge, Viewer...) are just counted, never listed.
+    last_scan_info['details'] holds (name, path) for nodes whose file is
+    present, so an empty result can still show what was looked at.
+    """
+    global last_scan_info
+    info = {'selected': len(names), 'no_path_knob': 0, 'existing': 0, 'details': []}
+    missing = []
+    for node_name in names:
+        knob_name, raw_value = _candidate_knob_for_node(node_name)
+        if not knob_name:
+            info['no_path_knob'] += 1
+            continue
+        state = path_state(raw_value)
+        if state != 'ok':
+            missing.append({
+                'node_name': node_name,
+                'knob_name': knob_name,
+                'raw_value': raw_value,
+                'basename': os.path.basename(_normalize(raw_value)),
+                'status': 'Missing' if state == 'missing' else 'Cloud only (not downloaded)',
+            })
+        else:
+            info['existing'] += 1
+            info['details'].append((node_name, raw_value))
+    last_scan_info = info
+    return missing
 
 
 def scan_selected():
@@ -203,32 +306,47 @@ def scan_selected():
     Scan the currently selected nodes for missing file paths. Zero Python
     node objects touched - safe no matter how many nodes are selected or
     how much of the Nuke Indie session's node budget other plugins have
-    already spent.
+    already spent. last_scan_info says how many nodes were selected / had
+    no path knob / exist on disk, so the UI can explain an empty result.
     Returns a list of dicts: node_name, knob_name, raw_value, basename, status.
     """
-    missing = []
-    for node_name in iter_selected_node_names():
-        knob_name, raw_value = _candidate_knob_for_node(node_name)
-        if not knob_name:
-            continue
-        if is_missing_path(raw_value):
-            missing.append({
-                'node_name': node_name,
-                'knob_name': knob_name,
-                'raw_value': raw_value,
-                'basename': os.path.basename(_normalize(raw_value)),
-                'status': 'Missing',
-            })
-    return missing
+    return _scan_names(list(iter_selected_node_names()))
 
 
 def scan_all_nodes():
     """
-    Scan EVERY node in the script. Unlike scan_selected(), there is no
-    TCL-only way to list all nodes, so this calls nuke.allNodes() and DOES
-    spend Nuke Indie's per-session node budget - roughly one unit per node
-    touched. Returns (missing_list, limit_hit).
+    Scan EVERY node in the current Node Graph level.
+
+    nuke.allNodes() hits Nuke Indie's node limit after ~10 nodes, so this
+    first does nuke.selectAll() (selects nodes, returns no Python node
+    objects) and then reads the selection by name via TCL like
+    scan_selected(). The user's previous selection is restored afterwards.
+    Only if that yields nothing does it fall back to nuke.allNodes().
+    Returns (missing_list, limit_hit).
     """
+    import nuke
+
+    previous = list(iter_selected_node_names())
+    try:
+        nuke.selectAll()
+        names = list(iter_selected_node_names())
+    except Exception as e:
+        log.warning('selectAll scan failed: %s' % e)
+        names = []
+
+    if names:
+        missing = _scan_names(names)
+        for n in names:
+            write_knob(n, 'selected', 'false')
+        for n in previous:
+            write_knob(n, 'selected', 'true')
+        return missing, False
+
+    return _scan_all_nodes_python()
+
+
+def _scan_all_nodes_python():
+    """Old path: nuke.allNodes(). Spends Indie's node budget (limit_hit=True when reached)."""
     import nuke
 
     missing = []
@@ -275,45 +393,59 @@ def scan_all_nodes():
 # ------------------------------------------------------------------
 
 def collect_files(search_root):
-    """Walk search_root recursively ONCE; return [(filename, directory), ...]."""
+    """
+    Walk search_root recursively ONCE; return [(filename, directory), ...].
+    Cloud placeholders that aren't downloaded (Dropbox online-only) are
+    skipped: relinking to them would still leave Nuke unable to read.
+    """
     collected = []
-    for root, _dirs, files in os.walk(search_root):
-        for f in files:
-            collected.append((f, root))
+    stack = [search_root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file() and not _is_cloud_only(entry.stat()):
+                            collected.append((entry.name, current))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
     return collected
 
 
 def find_replacement(item, file_index):
     """
-    Look for a match for item's basename inside file_index. Handles single
-    files and frame-padded sequences (case-insensitive). Returns a new,
-    properly formatted path string, or None if nothing matched.
+    Look for a match for item's path inside file_index. Handles single
+    files, frame sequences with the token anywhere in the name
+    (shot.####.cryptomatte.exr) and single frames, case-insensitive.
+    Returns a new, properly formatted path string, or None.
     """
     info = _split_sequence_pattern(item['raw_value'])
-    head, ext, style, padding = info['head'], info['ext'], info['style'], info['padding']
+    head, tail, style, padding = info['head'], info['tail'], info['style'], info['padding']
+    exact = (head + tail).lower() if style is None else os.path.basename(
+        _normalize(item['raw_value'])).lower()
 
-    if style is None:
-        target = item['basename'].lower()
+    if style in (None, 'number'):
         for fname, directory in file_index:
-            if fname.lower() == target:
+            if fname.lower() == exact:
                 return _normalize(os.path.join(directory, fname))
+        # A single specific frame: only that exact file counts. Never swap in
+        # a different frame number.
         return None
 
     pattern = re.compile(
-        r'^' + re.escape(head) + r'(\d+)' + re.escape(ext) + r'$', re.IGNORECASE
+        r'^' + re.escape(head) + r'(\d+)' + re.escape(tail) + r'$', re.IGNORECASE
     )
     for fname, directory in file_index:
         m = pattern.match(fname)
-        if m:
-            if style in ('printf', 'hash'):
-                # Genuine sequence token in the original knob (#### or
-                # %04d) - rebuild the pattern, preserving padding.
-                pad_to_use = padding if padding else len(m.group(1))
-                return _build_sequence_value(directory, head, ext, pad_to_use, style)
-            # style == 'number': the original path just happened to end in
-            # digits but is a single specific frame, not a real sequence -
-            # use the matched filename exactly as found on disk.
-            return _normalize(os.path.join(directory, fname))
+        if not m:
+            continue
+        pad_to_use = padding if padding else len(m.group(1))
+        return _build_sequence_value(directory, head, tail, pad_to_use, style)
     return None
 
 

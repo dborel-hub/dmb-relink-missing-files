@@ -57,6 +57,7 @@ class RelinkMissingPanel(QtWidgets.QWidget):
         self.table = QtWidgets.QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(['Node', 'Current Path', 'Status'])
         self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -90,26 +91,44 @@ class RelinkMissingPanel(QtWidgets.QWidget):
     def _finish_scan(self, limit_hit, selected_mode):
         self._populate_table()
         count = len(self.missing_items)
+        if count == 0:
+            self._show_details()
 
         if limit_hit:
             self.status_label.setText(
                 '%d missing file(s) found so far, but the Nuke Indie session '
                 'node limit was reached - some nodes could not be checked. '
-                'Restart Nuke, or use "Scan Selected Nodes" instead (it never '
-                'touches the node budget).' % count
+                'Restart Nuke, or use "Scan Selected Nodes" instead.' % count
             )
             self.relink_btn.setEnabled(count > 0)
         elif count == 0:
-            if selected_mode:
+            info = relink_core.last_scan_info
+            if info['selected'] == 0:
                 self.status_label.setText(
-                    'No missing files among the selected nodes (or nothing was selected).'
+                    'No selected node detected. Click the node(s) in the Node '
+                    'Graph first, then press Scan again.'
                 )
             else:
-                self.status_label.setText('No missing files found. Scene is clean.')
+                self.status_label.setText(
+                    'No missing files: %d node(s) checked, %d with a file '
+                    '(all found on disk), %d without a file path (ignored).'
+                    % (info['selected'], info['existing'], info['no_path_knob'])
+                )
             self.relink_btn.setEnabled(False)
         else:
             self.status_label.setText('%d missing file(s) found.' % count)
             self.relink_btn.setEnabled(True)
+
+    def _show_details(self):
+        """Nothing missing: list the nodes that have a file and where it points."""
+        details = relink_core.last_scan_info.get('details', [])
+        self.table.setRowCount(len(details))
+        for row, (name, path) in enumerate(details):
+            self.table.setItem(row, 0, QtWidgets.QTableWidgetItem(name))
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(path))
+            st = QtWidgets.QTableWidgetItem('Found')
+            st.setForeground(QtGui.QColor(theme.STATUS_OK))
+            self.table.setItem(row, 2, st)
 
     def _populate_table(self):
         self.table.setRowCount(len(self.missing_items))
@@ -123,6 +142,8 @@ class RelinkMissingPanel(QtWidgets.QWidget):
     def _colorize_status(self, table_item, status):
         if status == 'Relinked':
             table_item.setForeground(QtGui.QColor(theme.STATUS_OK))
+        elif status.startswith('Cloud'):
+            table_item.setForeground(QtGui.QColor(theme.STATUS_WARN))
         elif status == 'Not Found':
             table_item.setForeground(QtGui.QColor(theme.STATUS_BAD))
         elif status.startswith('Error'):

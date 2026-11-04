@@ -1,7 +1,5 @@
 # DMB Relink Missing Files
 
-![DMB Relink Missing Files panel](screenshots/panel.png)
-
 A Nuke panel that finds missing file paths (Read, Write, DeepRead,
 DeepWrite, Vectorfield, ReadGeo2, WriteGeo, Camera2/3, AudioRead, Precomp)
 and relinks them in bulk from a folder you choose (searched recursively,

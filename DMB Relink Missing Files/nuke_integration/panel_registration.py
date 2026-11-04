@@ -11,6 +11,7 @@ except ImportError:
     from PySide6 import QtWidgets, QtCore
 
 from ..log import log
+from ..config import APP_VERSION
 
 _window = None
 
@@ -21,7 +22,7 @@ class RelinkMissingWindow(QtWidgets.QMainWindow):
     def __init__(self, parent=None):
         super(RelinkMissingWindow, self).__init__(parent)
         self.setWindowFlags(QtCore.Qt.Window)
-        self.setWindowTitle("DMB - Relink Missing Files")
+        self.setWindowTitle("DMB - Relink Missing Files  v%s" % APP_VERSION)
 
     def closeEvent(self, event):
         panel = self.centralWidget()
