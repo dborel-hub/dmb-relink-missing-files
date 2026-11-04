@@ -1,0 +1,214 @@
+"""
+Update dialog - checks GitHub and downloads only the files that changed.
+Opened from  DMB Tools > DMB Relink Missing Files Updates...
+"""
+
+import threading
+
+try:
+    from PySide2 import QtWidgets, QtCore
+    from PySide2.QtCore import Qt, Signal
+except ImportError:
+    from PySide6 import QtWidgets, QtCore
+    from PySide6.QtCore import Qt, Signal
+
+from . import theme
+from .. import updater
+from ..config import APP_ROOT, APP_VERSION
+
+_dialog = None
+
+
+class _Worker(QtCore.QObject):
+    """Runs network work in a thread, reports back through signals."""
+    checked = Signal(object)          # plan dict
+    progress = Signal(int, int, str)  # done, total, path
+    finished = Signal(int)            # files written
+    failed = Signal(str)
+
+    def check(self):
+        def run():
+            try:
+                self.checked.emit(updater.check(APP_ROOT))
+            except Exception as e:
+                self.failed.emit(str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+    def apply(self, plan):
+        def run():
+            try:
+                n = updater.apply(APP_ROOT, plan,
+                                  progress=lambda d, t, p: self.progress.emit(d, t, p))
+                self.finished.emit(n)
+            except Exception as e:
+                self.failed.emit(str(e))
+        threading.Thread(target=run, daemon=True).start()
+
+
+class UpdateDialog(QtWidgets.QDialog):
+
+    def __init__(self, parent=None):
+        super(UpdateDialog, self).__init__(parent)
+        self.setWindowTitle("DMB Relink Missing Files - Updates")
+        self.setObjectName("dmbRoot")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(theme.stylesheet())
+        self.setMinimumSize(520, 380)
+        self._plan = None
+
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+
+        title = QtWidgets.QLabel("DMB Relink Missing Files updates")
+        title.setObjectName("dmbTitle")
+        lay.addWidget(title)
+
+        self.versions = QtWidgets.QLabel("Installed: %s" % APP_VERSION)
+        self.versions.setObjectName("dmbDim")
+        lay.addWidget(self.versions)
+
+        self.message = QtWidgets.QLabel("Checking GitHub...")
+        self.message.setWordWrap(True)
+        self.message.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.message.setMinimumHeight(self.message.fontMetrics().lineSpacing() * 3)
+        self.message.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+        lay.addWidget(self.message)
+
+        self.files = QtWidgets.QListWidget()
+        self.files.setObjectName("dmbNavList")
+        self.files.setStyleSheet("QListWidget { background: %s; border-radius: 6px; }" % theme.BG_FIELD)
+        lay.addWidget(self.files, 1)
+
+        self.bar = QtWidgets.QProgressBar()
+        self.bar.setObjectName("dmbWorkBar")
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(4)
+        self.bar.setRange(0, 0)           # busy until the check returns
+        lay.addWidget(self.bar)
+
+        buttons = QtWidgets.QHBoxLayout()
+        buttons.addStretch()
+        self.update_btn = QtWidgets.QPushButton("Update now")
+        self.update_btn.setObjectName("dmbAddButton")
+        self.update_btn.setEnabled(False)
+        self.update_btn.clicked.connect(self._start_update)
+        self.close_btn = QtWidgets.QPushButton("Close")
+        self.close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.update_btn)
+        buttons.addWidget(self.close_btn)
+        lay.addLayout(buttons)
+
+        self.worker = _Worker(self)
+        self.worker.checked.connect(self._on_checked)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.finished.connect(self._on_finished)
+        self.worker.failed.connect(self._on_failed)
+
+    def start_check(self):
+        self._plan = None
+        self.files.clear()
+        self.bar.setRange(0, 0)
+        self.bar.show()
+        self.update_btn.setEnabled(False)
+        self.message.setText("Checking GitHub...")
+        self.worker.check()
+
+    # ------------------------------------------------------------ results
+    def _on_checked(self, plan):
+        self._plan = plan
+        self.bar.hide()
+        remote_v = plan.get("remote_version") or "?"
+        self.versions.setText(
+            "Installed: %s    ·    GitHub: %s    ·    %s"
+            % (plan.get('local_version') or APP_VERSION, remote_v, plan['repo'])
+        )
+        changed, removed = plan["changed"], plan["removed"]
+        if not plan["update_available"]:
+            self.message.setText("You have the latest version.")
+            return
+        parts = []
+        if changed:
+            parts.append("%d file(s) to download" % len(changed))
+        if removed:
+            parts.append("%d old file(s) to remove" % len(removed))
+        self.message.setText(
+            "Update available: " + ", ".join(parts) +
+            ".\nYour settings (data folder) are not touched."
+        )
+        for rel in changed:
+            self.files.addItem("↓  " + rel)
+        for rel in removed:
+            self.files.addItem("✕  " + rel)
+        self.update_btn.setEnabled(True)
+
+    def _start_update(self):
+        if not self._plan:
+            return
+        self.update_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        total = max(1, len(self._plan["changed"]))
+        self.bar.setRange(0, total)
+        self.bar.setValue(0)
+        self.bar.show()
+        self.message.setText("Downloading...")
+        self.worker.apply(self._plan)
+
+    def _on_progress(self, done, total, path):
+        self.bar.setValue(done)
+        self.message.setText("Downloading %d / %d\n%s" % (done, total, path))
+
+    def _on_finished(self, count):
+        self.bar.hide()
+        self.close_btn.setEnabled(True)
+        self.files.clear()
+        new_v = (self._plan or {}).get("remote_version") or ""
+        self.message.setText(
+            "Updated%s (%d file(s)).\nRestart Nuke to load the new version."
+            % ((" to " + new_v) if new_v else "", count)
+        )
+
+    def _on_failed(self, error):
+        self.bar.hide()
+        self.close_btn.setEnabled(True)
+        self.update_btn.setEnabled(bool(self._plan and self._plan.get("update_available")))
+        self.message.setText("Could not update: %s" % error)
+
+
+def show_update_dialog(parent=None):
+    """Open (or raise) the update dialog and start a check."""
+    global _dialog
+    if parent is None:
+        try:
+            from ..nuke_integration.nuke_utils import get_nuke_main_window
+            parent = get_nuke_main_window()
+        except Exception:
+            parent = None
+    if _dialog is None:
+        _dialog = UpdateDialog(parent)
+    _dialog.show()
+    _dialog.raise_()
+    _dialog.activateWindow()
+    _dialog.start_check()
+    return _dialog
+
+
+# ------------------------------------------------------------------
+# Quiet background check (not wired up to the panel by default - call
+# UpdateNotifier().check() yourself if you want a startup check)
+# ------------------------------------------------------------------
+
+class UpdateNotifier(QtCore.QObject):
+    """Emits `available(version)` when GitHub has a newer APP_VERSION."""
+    available = Signal(str)
+
+    def check(self):
+        def run():
+            try:
+                repo, branch = updater.repo_settings(APP_ROOT)
+                remote = updater.remote_version(repo, branch)
+                if remote and updater.version_tuple(remote) > updater.version_tuple(APP_VERSION):
+                    self.available.emit(remote)
+            except Exception:
+                pass   # offline etc. - stay quiet
+        threading.Thread(target=run, daemon=True).start()
