@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.0.1
+## 1.0.2
 
 - **Fixed:** "Scan Selected Nodes" could report the same node hundreds of
   times (e.g. 500 "missing" rows for a single selected node). Root cause:
