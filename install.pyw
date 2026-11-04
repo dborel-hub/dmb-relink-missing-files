@@ -67,23 +67,19 @@ def _dmb_relink_open():
     from dmb_relink_missing_files.nuke_integration import show_relink_missing
     show_relink_missing()
 
-def _dmb_relink_updates():
-    _dmb_relink_load()
-    from dmb_relink_missing_files.nuke_integration import check_for_updates
-    check_for_updates()
-
 try:
     import nuke
     _dmb_tools = nuke.menu('Nuke').addMenu('DMB Tools')
     _dmb_tools.addCommand('Relink Missing Files', _dmb_relink_open)
-    _dmb_tools.addCommand('Relink Missing Files Updates...', _dmb_relink_updates)
     nuke.menu('Nodes').addCommand('DMB Tools/Relink Missing Files', _dmb_relink_open)
 except Exception as _e:
     print('[DMB Relink Missing Files] menu entry failed: %s' % _e)
 ''' + BLOCK_END + "\n"
 
 INSTALLER_BLOCK_RE = re.compile(r"\n*" + re.escape(BLOCK_START) + r".*?" + re.escape(BLOCK_END) + r"\n?", re.S)
-LEGACY_SIGNS = ("dmb_relink_missing", "dmb_startup_picker")   # hand-pasted versions from before this installer
+LEGACY_SIGNS = ("dmb_relink_missing",)   # hand-pasted versions from before this installer
+                                          # (not "dmb_startup_picker" - that's an unrelated,
+                                          # shared startup checklist used by other plugins too)
 OLD_VERSION_SIGNS = ()
 
 OK, WARN, MISSING, INFO = "ok", "warn", "missing", "info"

@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.1
+
+- **Fixed:** "Scan Selected Nodes" could report the same node hundreds of
+  times (e.g. 500 "missing" rows for a single selected node). Root cause:
+  `nuke.tcl('selected_node %d' % i)` called once per index from Python
+  does not raise an error when `i` goes out of range in real Nuke - it
+  silently returns the last valid result again, so the old per-call loop
+  never stopped. Rewritten to run the whole scan loop inside one TCL
+  script using `catch`, which correctly detects the real end of the
+  selection.
+- **Changed:** removed the "Relink Missing Files Updates..." menu entry.
+  Update checking is now automatic and silent: every time the panel opens
+  for the first time in a session, it checks GitHub in the background. If
+  (and only if) a newer version exists, a small popup appears with
+  "Update Now" / "OK". Any failure (offline, GitHub unreachable, etc.) is
+  ignored completely - nothing is shown.
+
 ## 1.0.0
 
 - Initial release, rebuilt from the DMB Nuke plugin pattern (installer,

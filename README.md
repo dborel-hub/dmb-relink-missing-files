@@ -33,7 +33,11 @@ Prefer "Scan Selected Nodes".
 
 ## Update
 
-- From Nuke: **DMB Tools > Relink Missing Files Updates...**
+- Automatic: every time you open **DMB Tools > Relink Missing Files** for
+  the first time in a Nuke session, it quietly checks GitHub in the
+  background. If a newer version exists, a small popup appears with
+  **Update Now** / **OK**. If you're already up to date, offline, or
+  GitHub can't be reached, nothing is shown.
 - From the installer: **Update from GitHub** (downloads only the files
   that changed).
 

@@ -8,7 +8,7 @@ from .log import log
 
 # Application metadata
 APP_NAME = "DMB Relink Missing Files"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 AUTHOR = "Daniel Marinho Borel"
 CONTACT = "danielmborel@gmail.com"
 

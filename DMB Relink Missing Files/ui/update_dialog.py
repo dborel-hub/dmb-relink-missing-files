@@ -194,8 +194,12 @@ def show_update_dialog(parent=None):
 
 
 # ------------------------------------------------------------------
-# Quiet background check (not wired up to the panel by default - call
-# UpdateNotifier().check() yourself if you want a startup check)
+# Quiet background check - call check_for_updates_silently() wherever you
+# want this to run (wired into panel_registration.show_relink_missing() so
+# it happens automatically the first time the panel opens each session).
+# Does nothing at all unless GitHub actually has a newer version: no menu
+# entry, no dialog, no console noise, and any error (offline, GitHub
+# unreachable, etc.) is swallowed quietly.
 # ------------------------------------------------------------------
 
 class UpdateNotifier(QtCore.QObject):
@@ -212,3 +216,47 @@ class UpdateNotifier(QtCore.QObject):
             except Exception:
                 pass   # offline etc. - stay quiet
         threading.Thread(target=run, daemon=True).start()
+
+
+_silent_notifiers = []  # keep notifiers alive until their signal fires
+
+
+def check_for_updates_silently(parent=None):
+    """
+    Quiet background check. If (and only if) GitHub has a version newer
+    than APP_VERSION, shows a small popup with two buttons:
+      - "Update Now" - opens the full update dialog (download + progress)
+      - "OK"         - dismiss, do nothing, don't ask again this session
+    Any failure (offline, GitHub down, rate-limited, etc.) is ignored
+    completely - nothing is shown.
+    """
+    if parent is None:
+        try:
+            from ..nuke_integration.nuke_utils import get_nuke_main_window
+            parent = get_nuke_main_window()
+        except Exception:
+            parent = None
+
+    notifier = UpdateNotifier()
+    _silent_notifiers.append(notifier)
+
+    def _on_available(remote_version):
+        try:
+            _silent_notifiers.remove(notifier)
+        except ValueError:
+            pass
+        box = QtWidgets.QMessageBox(parent)
+        box.setWindowTitle("DMB Relink Missing Files")
+        box.setIcon(QtWidgets.QMessageBox.Information)
+        box.setText(
+            "A new version is available.\n\nInstalled: %s\nGitHub: %s"
+            % (APP_VERSION, remote_version)
+        )
+        update_btn = box.addButton("Update Now", QtWidgets.QMessageBox.AcceptRole)
+        box.addButton("OK", QtWidgets.QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is update_btn:
+            show_update_dialog(parent)
+
+    notifier.available.connect(_on_available)
+    notifier.check()

@@ -9,4 +9,4 @@ broken nodes and relinking them - never touches Nuke Indie's per-session
 10-node Python budget, no matter how many nodes are involved.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"

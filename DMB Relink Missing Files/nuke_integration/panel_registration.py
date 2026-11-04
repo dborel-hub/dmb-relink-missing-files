@@ -73,4 +73,11 @@ def show_relink_missing():
 
     window.show()
     _window = window
+
+    try:
+        from ..ui.update_dialog import check_for_updates_silently
+        check_for_updates_silently(nuke_main)
+    except Exception as e:
+        log.warning("Update check skipped: %s", e)
+
     return window

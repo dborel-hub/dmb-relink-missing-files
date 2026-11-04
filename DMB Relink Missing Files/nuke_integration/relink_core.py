@@ -51,20 +51,44 @@ def _q(value):
 
 def iter_selected_node_names(max_nodes=500):
     """
-    Yield the name of every currently selected node, via repeated
-    'selected_node <i>' TCL calls. Confirmed safe under Nuke Indie's
-    per-session node budget - no Python node object is ever created,
-    so this works regardless of how much of that budget other tools
-    (or earlier calls) have already spent this session.
+    Yield the name of every currently selected node.
+
+    IMPORTANT: this must NOT call nuke.tcl('selected_node %d' % i) once per
+    index from Python. In real Nuke (confirmed by testing), once the index
+    goes out of range, 'selected_node <i>' errors INSIDE the TCL
+    interpreter, but nuke.tcl() does not raise a Python exception for it -
+    it silently returns the last successful result again. Looping that from
+    Python therefore never stops: it just repeats the last real node name
+    until max_nodes is hit (this previously showed, e.g., one selected node
+    500 times over).
+
+    Instead, do the whole loop inside a single TCL script, using TCL's own
+    'catch' to detect the real out-of-range error and stop there. One
+    nuke.tcl() call, no Python node objects, no per-index ambiguity.
     """
-    for i in range(max_nodes):
-        try:
-            name = _tcl('selected_node %d' % i)
-        except Exception:
-            break
-        if not name:
-            break
-        yield name
+    script = (
+        'set _dmb_names {}\n'
+        'for {set _dmb_i 0} {$_dmb_i < %d} {incr _dmb_i} {\n'
+        '    if {[catch {set _dmb_n [selected_node $_dmb_i]}]} { break }\n'
+        '    lappend _dmb_names $_dmb_n\n'
+        '}\n'
+        'join $_dmb_names "\\n"'
+    ) % max_nodes
+
+    try:
+        result = _tcl(script)
+    except Exception:
+        return
+
+    if not result:
+        return
+
+    seen = set()
+    for name in result.split('\n'):
+        name = name.strip()
+        if name and name not in seen:
+            seen.add(name)
+            yield name
 
 
 def read_knob(node_name, knob_name):
